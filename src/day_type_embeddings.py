@@ -21,7 +21,7 @@ from kerastuner import HyperParameters
 from helpers import api, data_utils
 from models.keras import DayTypeEmbeddingsModel, HyperbandBatchSizeTuner
 
-parser = argparse.ArgumentParser(description='Trains and tests link travel time baseline model.')
+parser = argparse.ArgumentParser(description='Trains and tests link travel time embeddings model.')
 parser.add_argument('group', help='unique link reference.')
 parser.add_argument('time', help='datetime in isoformat.')
 parser.add_argument('--tune', default=False, action='store_true')
@@ -46,7 +46,7 @@ with open(f'../output/links_{args.group}.txt') as f:
 time = pd.to_datetime(args.time)
 
 MODEL_NAME = 'day_type_embeddings'
-N_NORMAL_DAYS = 21
+N_NORMAL_DAYS = 28
 N_PRED_DAYS = 7
 
 HYPERBAND_MAX_EPOCHS = 40
@@ -68,25 +68,31 @@ for link_ref in link_refs:
     time_slug = time.date().isoformat().replace('-', '')
     output_directory = f'../output/{MODEL_NAME}/{args.group}/{link_ref_slug}'
 
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-
     train_normal_days = api.link_travel_time_n_preceding_normal_days(link_ref, time, N_NORMAL_DAYS)
     train_normal_days['day_type'] = train_normal_days.index.day_name()
     train_normal_days['link_travel_time_exp'] = train_normal_days.rolling(window=20, center=True, min_periods=1)['link_travel_time'].mean().round(1)
     train_special_days = api.link_travel_time_special_days(link_ref, time - pd.DateOffset(years = 1), time)
     train_special_days['link_travel_time_exp'] = train_special_days.rolling(window=20, center=True, min_periods=1)['link_travel_time'].mean().round(1)    
-
-    if len(train_special_days) > 0:
+    test = api.link_travel_time(link_ref, time, test_end_time)
+    test['link_travel_time_exp'] = test.rolling(window=20, center=True, min_periods=1)['link_travel_time'].mean().round(1)
+    
+    if len(train_normal_days) == 0 or len(test) == 0:
+        continue    
+    
+    if len(train_special_days) > 0 and args.group != 'unseen':
         # This add normalization features to special days
         train_special_days = data_utils.normalize_special_days(link_ref, train_special_days)
         train = pd.concat([train_special_days, train_normal_days])
     else:
         train = train_normal_days
 
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+        
     print('train_normal_days', len(train_normal_days))
     print('train_special_days', len(train_special_days))
     print('train', len(train))
+    print('test', len(test))  
 
     model = DayTypeEmbeddingsModel(daytype_components, pd.concat([cal_train, cal_test]))
     model.choose_tod_bins(train_normal_days)
@@ -123,8 +129,7 @@ for link_ref in link_refs:
 
         # Get best hyper parameters, add epoch from possible early stopping
         best_hp = tuner.get_best_hyperparameters()[0]
-    
-                    
+                        
         # Final train/validation loop, using best HP to choose epochs based on Early Stopping.
         K.clear_session()
         model.build_and_train(hp_train, hp_val, best_hp, callbacks=[keras.callbacks.EarlyStopping('val_loss', patience=10)], verbose = 0)
@@ -147,12 +152,11 @@ for link_ref in link_refs:
     print('Using Hyper Parameters:')
     print(best_hp.values)    
         
-    # Test train/validation loop
-    test = api.link_travel_time(link_ref, time, test_end_time)
-    test['link_travel_time_exp'] = test.rolling(window=20, center=True, min_periods=1)['link_travel_time'].mean().round(1)
-    print('test', len(test))  
-    
+    # Test train/validation loop    
     K.clear_session()    
+    model = DayTypeEmbeddingsModel(daytype_components, pd.concat([cal_train, cal_test]))
+    model.choose_tod_bins(train_normal_days)
+    model.y_names = ['link_travel_time_exp']
     model.build_and_train(train, test, best_hp, verbose = 0)
     hist = pd.DataFrame(model.model.history.history)
     hist.index.name = 'epoch'
@@ -164,13 +168,6 @@ for link_ref in link_refs:
     train.to_csv(f"{output_directory}/train_{time_slug}.csv")
     test.to_csv(f"{output_directory}/test_{time_slug}.csv")
     hist.to_csv(f"{output_directory}/hist_{time_slug}.csv")
-    
-    # Add some last minute parameters that we would like to monitor.    
-    #best_hp.values['n_hp_train'] = len(hp_train_normal_days)
-    #best_hp.values['n_hp_val'] = len(hp_val_normal_days)
-    #best_hp.values['n_train'] = len(train_normal_days)
-    #best_hp.values['n_test'] = len(test)
-    #best_hp.values['tod_bins_n'] = model.tod_bins_n
     
     # Save visual plot of the model (for debugging)
     plot_model(model.model, f'{output_directory}/model.png', show_shapes=True)

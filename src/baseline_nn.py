@@ -23,6 +23,7 @@ from models.keras import BaselineModel, HyperbandBatchSizeTuner
 parser = argparse.ArgumentParser(description='Trains and tests link travel time baseline model.')
 parser.add_argument('group', help='unique link reference.')
 parser.add_argument('time', help='datetime in isoformat.')
+parser.add_argument('--tune', default=False, action='store_true')
 parser.add_argument('--gpu', default='0', help='gpu (or list of gpus) to run on')
 args = parser.parse_args()
 
@@ -44,7 +45,7 @@ with open(f'../output/links_{args.group}.txt') as f:
 time = pd.to_datetime(args.time)
 
 MODEL_NAME = 'baseline_nn'
-N_NORMAL_DAYS = 21
+N_NORMAL_DAYS = 28
 N_PRED_DAYS = 7
 
 HYPERBAND_MAX_EPOCHS = 40
@@ -64,9 +65,6 @@ for link_ref in link_refs:
     time_slug = time.date().isoformat().replace('-', '')
     output_directory = f'../output/{MODEL_NAME}/{args.group}/{link_ref_slug}'
 
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-
     train_normal_days = api.link_travel_time_n_preceding_normal_days(link_ref, time, N_NORMAL_DAYS)
     train_normal_days['day_type'] = cal_train.loc[train_normal_days.index.date, 'day_type'].values
     train_normal_days['link_travel_time_exp'] = train_normal_days.rolling(window=20, center=True, min_periods=1)['link_travel_time'].mean().round(1)
@@ -74,6 +72,12 @@ for link_ref in link_refs:
     test['day_type'] = cal_test.loc[test.index.date, 'day_type'].values
     test['link_travel_time_exp'] = test.rolling(window=20, center=True, min_periods=1)['link_travel_time'].mean().round(1)
 
+    if len(train_normal_days) == 0 or len(test) == 0:
+        continue
+        
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+    
     print('train_normal_days', len(train_normal_days))
     print('test', len(test))                
     
@@ -82,43 +86,50 @@ for link_ref in link_refs:
     model.y_names = ['link_travel_time_exp']
     
     # Hyper Parameter Optimization
-    K.clear_session()
-    hp_train_normal_days, hp_val_normal_days = data_utils.split_normal_days_train_val(train_normal_days)
-    X_train = model.transform(hp_train_normal_days, is_training = True)
-    Y_train = model.transform_y(hp_train_normal_days, is_training = True)
-    X_val = model.transform(hp_val_normal_days, is_training = False)
-    Y_val = model.transform_y(hp_val_normal_days, is_training = False)
-    tuner = HyperbandBatchSizeTuner(
-        model.build_model,
-        objective='val_loss',
-        max_epochs=HYPERBAND_MAX_EPOCHS,
-        executions_per_trial=EXECUTION_PER_TRIAL,
-        batch_sizes=[50, 100, 500, 1000],
-        seed=SEED,
-        directory=output_directory,
-        project_name='hyperband')
+    if args.tune:
+        K.clear_session()
+        hp_train, hp_val = data_utils.split_normal_days_train_val(train_normal_days)
+        X_train = model.transform(hp_train, is_training = True)
+        Y_train = model.transform_y(hp_train, is_training = True)
+        X_val = model.transform(hp_val, is_training = False)
+        Y_val = model.transform_y(hp_val, is_training = False)
+        tuner = HyperbandBatchSizeTuner(
+            model.build_model,
+            objective='val_loss',
+            max_epochs=HYPERBAND_MAX_EPOCHS,
+            executions_per_trial=EXECUTION_PER_TRIAL,
+            batch_sizes=[50, 100, 500, 1000],
+            seed=SEED,
+            directory=output_directory,
+            project_name='hyperband')
+
+        #print(tuner.search_space_summary())
+
+        tuner.search(X_train, Y_train,
+                     epochs=20,
+                     validation_data=(X_val, Y_val),
+                     callbacks=[keras.callbacks.EarlyStopping('val_loss', patience=3)])
+
+        best_hp = tuner.get_best_hyperparameters()[0]
+        
+        # Final train/validation loop, using best HP to choose epochs based on Early Stopping.
+        K.clear_session()
+        model.build_and_train(hp_train, hp_val, best_hp, callbacks=[keras.callbacks.EarlyStopping('val_loss', patience=10)], verbose = 0)
+        hp_hist = pd.DataFrame(model.model.history.history)
+        hp_hist.index.name = 'epoch'
+        hp_hist.index = hp_hist.index + 1
+        hp_hist.to_csv(f"{output_directory}/hp_hist_{time_slug}.csv")
+
+        print('Epochs:', len(hp_hist))
+        best_hp.values['epochs'] = len(hp_hist) - 1
     
-    #print(tuner.search_space_summary())
-
-    tuner.search(X_train, Y_train,
-                 epochs=20,
-                 validation_data=(X_val, Y_val),
-                 callbacks=[keras.callbacks.EarlyStopping('val_loss', patience=3)])
-
-    best_hp = tuner.get_best_hyperparameters()[0]
-    print('Best Hyper Parameters:')    
-    print(best_hp.values)
-
-    # Final train/validation loop, using best HP to choose epochs based on Early Stopping.
-    K.clear_session()
-    model.build_and_train(hp_train_normal_days, hp_val_normal_days, best_hp, callbacks=[keras.callbacks.EarlyStopping('val_loss', patience=10)], verbose = 0)   
-    hp_hist = pd.DataFrame(model.model.history.history)
-    hp_hist.index.name = 'epoch'
-    hp_hist.index = hp_hist.index + 1
-    hp_hist.to_csv(f"{output_directory}/hp_hist_{time_slug}.csv")
-    
-    print('Epochs:', len(hp_hist))
-    best_hp.values['epochs'] = len(hp_hist) - 1
+        with open(f'{output_directory}/hyperparameters.json', 'w') as f:
+            json.dump(best_hp.get_config(), f)
+            
+        plot_model(model.model, f'{output_directory}/model.png', show_shapes=True)
+    else:
+        with open(f'{output_directory}/hyperparameters.json', 'r') as f:            
+            best_hp = HyperParameters.from_config(json.load(f))
     
     # Train/test loop    
     K.clear_session()
@@ -134,15 +145,5 @@ for link_ref in link_refs:
     test.to_csv(f"{output_directory}/test_{time_slug}.csv")
     hist.to_csv(f"{output_directory}/hist_{time_slug}.csv")
 
-    # Add some last minute parameters/metrics that we would like to monitor, altough they are not really hyper parameters. 
-    best_hp.values['n_hp_train'] = len(hp_train_normal_days)
-    best_hp.values['n_hp_val'] = len(hp_val_normal_days)
-    best_hp.values['n_train'] = len(train_normal_days)
-    best_hp.values['n_test'] = len(test)
-    best_hp.values['tod_bins_n'] = model.tod_bins_n
-    
-    with open(f'{output_directory}/hyperparameters.json', 'w') as f:
-        json.dump(best_hp.get_config(), f)
-    
     # Save visual plot of the model (for debugging)
     plot_model(model.model, f'{output_directory}/model.png', show_shapes=True)
